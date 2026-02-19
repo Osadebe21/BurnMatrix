@@ -191,6 +191,164 @@
     )
 )
 
+;; @desc Execute an Advanced Dynamic Burn Cycle.
+;; This function is the core of the AI-driven mechanism. It accepts data points
+;; regarding the market verified by the oracle and computes a burn amount.
+;;
+;; The algorithm works in multiple stages:
+;; 1. Base Rate: Derived from 24h volume.
+;; 2. Volatility Adjustment: Amplifies burn in high volatility to signal stability.
+;; 3. Sentiment Adjustment: Increases burn in bearish markets to reduce supply pressure.
+;; 4. Liquidity Safety: Dampens the burn if liquidity depth is too low to prevent slippage shocks.
+;;
+;; @param volatility-index: 0-100 scale representing market volatility (VIX style).
+;; @param sentiment-score: 0-100 scale (<50 bearish, >50 bullish).
+;; @param volume-24h: The 24h trading volume (in token units).
+;; @param liquidity-depth: A score or amount representing market depth (0-1000 scale).
+;; @param moving-average-price: The 7-day moving average price (scaled).
+(define-public (execute-dynamic-burn-cycle 
+    (volatility-index uint) 
+    (sentiment-score uint) 
+    (volume-24h uint)
+    (liquidity-depth uint)
+    (moving-average-price uint))
+    (let
+        (
+            ;; ---------------------------------------------------------------------
+            ;; Step 1: Validation & Authorization
+            ;; ---------------------------------------------------------------------
+            ;; Ensure the system is running and the caller is authorized.
+            (check-active (asserts! (is-active) err-contact-paused))
+            (check-auth (asserts! (is-ai-oracle) err-ai-only))
+
+            ;; ---------------------------------------------------------------------
+            ;; Step 2: Base Calculation
+            ;; ---------------------------------------------------------------------
+            ;; Start with a conservative base rate of 0.05% of the 24h volume.
+            ;; Logic: Higher volume supports higher burns without impacting liquidity.
+            (base-rate-bps u5) ;; 5 basis points (0.05%)
+            (base-burn (/ (* volume-24h base-rate-bps) u10000))
+
+            ;; ---------------------------------------------------------------------
+            ;; Step 3: Volatility Multiplier
+            ;; ---------------------------------------------------------------------
+            ;; High volatility (> 75) indicates market uncertainty.
+            ;; We double the burn rate to signal protocol confidence and reduce float.
+            ;; Moderate volatility (40-75) gets a 1.5x multiplier.
+            ;; Low volatility (< 40) keeps the standard 1.0x rate.
+            (volatility-mult 
+                (if (> volatility-index u75) 
+                    u200 ;; 2.00x
+                    (if (> volatility-index u40)
+                        u150 ;; 1.50x
+                        u100 ;; 1.00x
+                    )
+                )
+            )
+
+            ;; ---------------------------------------------------------------------
+            ;; Step 4: Sentiment Adjustment
+            ;; ---------------------------------------------------------------------
+            ;; Bearish sentiment (< 40) suggests selling pressure.
+            ;; We increase burn by 20% to counteract supply inflation.
+            ;; Neutral sentiment (40-60) gets no change.
+            ;; Bullish sentiment (> 60) reduces burn by 10% (market checks itself).
+            (sentiment-factor
+                (if (< sentiment-score u40)
+                    u120 ;; 1.20x (Bearish boost)
+                    (if (> sentiment-score u60)
+                        u90  ;; 0.90x (Bullish taper)
+                        u100 ;; 1.00x (Neutral)
+                    )
+                )
+            )
+
+            ;; ---------------------------------------------------------------------
+            ;; Step 5: Liquidity Dampener (Safety Mechanism)
+            ;; ---------------------------------------------------------------------
+            ;; If liquidity depth is low (< 200 on our scale), strictly reduce the burn.
+            ;; We do not want to burn tokens if the market is too thin.
+            ;; If depth < 200, multiplier is 0.5x. Otherwise 1.0x.
+            (liquidity-dampener
+                (if (< liquidity-depth u200)
+                    u50  ;; 0.50x
+                    u100 ;; 1.00x
+                )
+            )
+
+            ;; ---------------------------------------------------------------------
+            ;; Step 6: Final Amount Aggregation
+            ;; ---------------------------------------------------------------------
+            ;; Formula: Base * Volatility * Sentiment * Liquidity / (Scaling Factors)
+            ;; Note: We have 3 multipliers scaled by 100 each.
+            ;; Denominator = 100 * 100 * 100 = 1,000,000
+            (raw-burn-amount 
+                (/ 
+                    (* (* (* base-burn volatility-mult) sentiment-factor) liquidity-dampener) 
+                    u1000000
+                )
+            )
+        )
+
+        ;; -------------------------------------------------------------------------
+        ;; Step 7: Final Validations
+        ;; -------------------------------------------------------------------------
+        
+        ;; Ensure we aren't burning nothing
+        (asserts! (> raw-burn-amount u0) err-invalid-burn-amount)
+
+        ;; Ensure we don't exceed the safety cap per cycle
+        (asserts! (<= raw-burn-amount (var-get max-burn-per-cycle)) err-burn-limit-exceeded)
+
+        ;; -------------------------------------------------------------------------
+        ;; Step 8: Execution
+        ;; -------------------------------------------------------------------------
+        ;; Burn the tokens from the AI Agent's wallet (tx-sender)
+        (try! (ft-burn? ai-token raw-burn-amount tx-sender))
+
+        ;; Update global total
+        (var-set total-burned (+ (var-get total-burned) raw-burn-amount))
+
+        ;; Log to history
+        (log-burn-event 
+            raw-burn-amount 
+            "ai-dynamic-burn-v2" 
+            volatility-index 
+            sentiment-score 
+            liquidity-depth
+        )
+
+        ;; Emit detailed telemetry event
+        (print {
+            action: "dynamic-burn-v2-complete",
+            burn-amount: raw-burn-amount,
+            inputs: {
+                vol: volatility-index,
+                sent: sentiment-score,
+                liq: liquidity-depth,
+                vol-24h: volume-24h,
+                ma-price: moving-average-price
+            },
+            multipliers: {
+                vol-mult: volatility-mult,
+                sent-fact: sentiment-factor,
+                liq-damp: liquidity-dampener
+            }
+        })
+
+        ;; -------------------------------------------------------------------------
+        ;; Step 9: Return
+        ;; -------------------------------------------------------------------------
+        ;; Return a success tuple with the new state
+        (ok {
+            burned: raw-burn-amount,
+            new-total-burned: (var-get total-burned),
+            cap-remaining: (- (var-get max-burn-per-cycle) raw-burn-amount),
+            status: "optimized-burn-executed"
+        })
+    )
+)
+
 ;; =================================================================================
 ;; GETTERS (Read-Only)
 ;; =================================================================================
